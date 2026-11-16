@@ -14,9 +14,14 @@
 //   2. Inline tokenization of a run of text with no inline markup at all is
 //      short-circuited to a single text token, which is exactly what marked's
 //      inline loop produces for such a run.
-//   3. The carriage-return normalization is skipped when the input holds no
+//   3. For runs that do hold markup, a reimplementation of marked's inline
+//      loop dispatches on the character instead of trying every rule at
+//      every position, finds text runs by scanning instead of by the text
+//      regex, and computes the emphasis mask lazily. The tokenizers it
+//      calls are still marked's own, in marked's order.
+//   4. The carriage-return normalization is skipped when the input holds no
 //      carriage return.
-//   4. One Lexer/Parser pair is reused across calls, with its per-document
+//   5. One Lexer/Parser pair is reused across calls, with its per-document
 //      state reset before each parse, instead of allocating a fresh pair
 //      (and fresh option objects) per document.
 //
@@ -79,6 +84,16 @@ function isFtpAt(src, i) {
   return (c1 === 116 || c1 === 84) && (c2 === 112 || c2 === 80) && src.charCodeAt(i + 3) === 58;
 }
 
+// Is this character one that may precede a www. autolink? Marked's text
+// rule only stops at www. when the previous character is whitespace or one
+// of * _ ~ (, or when there is no previous character at all.
+function isWwwPrefixChar(c) {
+  if (c === 32 || c === 9 || c === 10 || c === 13 || c === 12 || c === 11 || c === 42 || c === 95 || c === 126 || c === 40) return true;
+  // Non-ASCII whitespace (NBSP and friends) — rare, fall back to the regex.
+  if (c >= 128) return /\s/.test(String.fromCharCode(c));
+  return false;
+}
+
 // Is there an e-mail address with its '@' at index i? The address needs
 // local-part characters before the '@' and a dotted domain after it.
 function isEmailAt(src, i) {
@@ -97,6 +112,37 @@ function isEmailAt(src, i) {
     j++;
   }
   return sawAlnum;
+}
+
+// Replicates marked's internal label normalizer (used for link-reference
+// lookup): trim, collapse whitespace, lower -> upper -> lower.
+function normalizeLabel(label, multipleSpaceGlobal) {
+  return label.trim().replace(multipleSpaceGlobal, ' ').toLowerCase().toUpperCase().toLowerCase();
+}
+
+// Replicates marked's internal unescape: decodes numeric character references
+// (&#169; / &#xA9; -> the character, with the replacement-char rules) and
+// escapes bare '&' to '&amp;'. Named entities are NOT decoded (marked leaves
+// &copy; / &amp; / &nbsp; untouched here; the renderer handles the rest).
+// Uses marked's own regexes (passed in) so the match set is identical.
+function unescapeNumeric(text, other) {
+  if (!other.numericCharacterReference.test(text)) return text;
+  return text.replace(other.numericCharacterReferenceOrAmpersand, (m, dec, hex) => {
+    if (dec === undefined && hex === undefined) return '&amp;';
+    const code = hex === undefined ? parseInt(dec, 10) : parseInt(hex, 16);
+    if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return '\uFFFD';
+    if (code === 38) return '&amp;';
+    return String.fromCodePoint(code);
+  });
+}
+
+// Is there an e-mail address starting at index i? The local part is
+// [A-Za-z0-9._+-]+, then '@', then a domain (see isEmailAt).
+function isEmailStartAt(src, i) {
+  let j = i;
+  while (isMailLocal(src.charCodeAt(j))) j++;
+  if (src.charCodeAt(j) !== 64) return false; // needs '@'
+  return isEmailAt(src, j);
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +458,224 @@ class FastLexer extends Lexer {
       });
       return tokens;
     }
-    return super.inlineTokens(src, tokens);
+    return this.inlineLoop(src, tokens);
+  }
+
+  // Replicates marked's private emphasis mask. The mask replaces link
+  // references, code spans and escapes with placeholder characters of the
+  // same length, so emphasis delimiters inside them cannot open or close.
+  // It is length-preserving, which is what lets emStrong/del line the mask
+  // up with the original text by offset.
+  computeMask(src) {
+    const inline = this.tokenizer.rules.inline;
+    const other = this.tokenizer.rules.other;
+    let t = src;
+    if (this.tokens.links && src.includes('[')) {
+      const n = inline.reflinkSearch;
+      const maskReflink = (r) => {
+        const o = r.lastIndexOf('[');
+        if (!Object.hasOwn(this.tokens.links, normalizeLabel(r.slice(o + 1, -1), other.multipleSpaceGlobal))) return r;
+        if (o > 1 && r.charAt(0) !== '!') {
+          const i = r.slice(1, o - 1);
+          if (this.linkInText(i)) return '[' + i.replace(n, maskReflink) + '][' + 'a'.repeat(r.length - o - 2) + ']';
+        }
+        return '[' + 'a'.repeat(r.length - 2) + ']';
+      };
+      t = t.replace(n, maskReflink);
+    }
+    t = t.replace(inline.anyPunctuationOutsideCode, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+    t = t.replace(inline.blockSkip, (n, s, r) => {
+      const o = r ? r.length : 0;
+      return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']';
+    });
+    return this.options.hooks?.emStrongMask?.call({ lexer: this }, t) ?? t;
+  }
+
+  // A direct reimplementation of marked's inline loop: the same tokenizers
+  // are tried in the same order at the same positions, but the loop
+  // dispatches on the character instead of trying every rule at every
+  // position, and text runs are found by scanning instead of by the text
+  // regex. The emphasis mask is computed lazily (only when a delimiter
+  // could actually open emphasis) and cached for the rest of the call.
+  // Text runs merge with a preceding text token exactly as marked's loop
+  // merges them, and the previous-character value `r` that emStrong/del
+  // read follows the same rules (last char of the previous text run,
+  // unless it is '_'; reset after any non-text token).
+  inlineLoop(src, tokens) {
+    const tz = this.tokenizer;
+    const other = tz.rules.other;
+    const n = src.length;
+    const savedLinkParen = this.state.linkParenPossible;
+    this.state.linkParenPossible = savedLinkParen && src.includes(')');
+    // No '@' in the text means no e-mail autolink can exist, so the
+    // word-start address check can be skipped for the whole run.
+    const hasAt = src.includes('@');
+    let masked = null;
+    let r = '';
+    let i = 0;
+    let runStart = 0;
+    try {
+      // The loop also runs while a text run is still pending: a failed
+      // dispatch at the very last character leaves i at the end with one
+      // character of run un-emitted, and that character must still come out.
+      while (i < n || runStart < n) {
+        // Find the next position where a rule could match.
+        let stop = -1;
+        let j = i;
+        while (j < n) {
+          const c = src.charCodeAt(j);
+          // Word start with an e-mail address: the autolink is tried before
+          // any rule that could match inside the word (marked's text regex
+          // stops at the address start, and the url rule is what the loop
+          // reaches there). Checking at the word start, rather than
+          // backtracking from '@', also keeps the stop ahead of the scan.
+          if (hasAt && isMailLocal(c) && (j === runStart || !isMailLocal(src.charCodeAt(j - 1)))) {
+            if (isEmailStartAt(src, j)) {
+              stop = j;
+              break;
+            }
+          }
+          if (c === 92 || c === 60 || c === 96 || c === 42 || c === 95 || c === 126 || c === 91) {
+            stop = j;
+            break;
+          }
+          if (c === 33 && src.charCodeAt(j + 1) === 91) {
+            stop = j;
+            break;
+          }
+          if (c === 10) {
+            // Newline: a hard break needs two or more spaces right before
+            // it, inside the part of the run not scanned yet. The run stops
+            // at the first of them.
+            let k = j - 1;
+            while (k >= i && src.charCodeAt(k) === 32) k--;
+            if (j - 1 - k >= 2) {
+              stop = k + 1;
+              break;
+            }
+          } else if (c === 119) {
+            // www. only autolinks at the start of the run or after
+            // whitespace or * _ ~ ( — mid-word it is plain text.
+            if (
+              src.charCodeAt(j + 1) === 119 &&
+              src.charCodeAt(j + 2) === 119 &&
+              src.charCodeAt(j + 3) === 46 &&
+              (j === runStart || isWwwPrefixChar(src.charCodeAt(j - 1)))
+            ) {
+              stop = j;
+              break;
+            }
+          } else if (c === 104 || c === 72) {
+            if (isHttpAt(src, j)) {
+              stop = j;
+              break;
+            }
+          } else if (c === 102 || c === 70) {
+            if (isFtpAt(src, j)) {
+              stop = j;
+              break;
+            }
+          } else if (c === 109) {
+            // mailto: only autolinks at the start of the run or after a
+            // non-alphanumeric character — mid-word it is plain text (and
+            // the address after the colon may still autolink as e-mail).
+            if (src.startsWith('mailto:', j) && (j === runStart || !isAlnum(src.charCodeAt(j - 1)))) {
+              stop = j;
+              break;
+            }
+          } else if (c === 120) {
+            if (src.startsWith('xmpp:', j) && (j === runStart || !isAlnum(src.charCodeAt(j - 1)))) {
+              stop = j;
+              break;
+            }
+          }
+          j++;
+        }
+        if (stop < 0) stop = n;
+        // Emit the text run before the stop, merged with a preceding text
+        // token. In a raw block the text is not unescaped.
+        if (stop > runStart) {
+          const raw = src.slice(runStart, stop);
+          const text = this.state.inRawBlock || !raw.includes('&') ? raw : unescapeNumeric(raw, other);
+          const last = tokens[tokens.length - 1];
+          if (last && last.type === 'text') {
+            last.raw += raw;
+            last.text += text;
+          } else {
+            tokens.push({ type: 'text', raw, text, escaped: this.state.inRawBlock });
+          }
+          const lastChar = raw.charCodeAt(raw.length - 1);
+          if (lastChar !== 95) r = raw.slice(-1);
+          i = stop;
+          runStart = stop;
+        }
+        if (stop >= n) break;
+        // Dispatch at the stop position, in marked's rule order, restricted
+        // to the rules that can match at this character.
+        const c = src.charCodeAt(stop);
+        const rest = src.slice(stop);
+        let tok;
+        if (c === 92) {
+          tok = tz.escape(rest) || tz.br(rest);
+        } else if (c === 60) {
+          tok = tz.tag(rest) || tz.autolink(rest);
+        } else if (c === 91 || c === 33) {
+          tok = tz.link(rest) || tz.reflink(rest, this.tokens.links);
+        } else if (c === 96) {
+          tok = tz.codespan(rest);
+        } else if (c === 42) {
+          tok = tz.emStrong(rest, masked ??= this.computeMask(src), r);
+        } else if (c === 95) {
+          // '_' is also an e-mail local character: after emStrong fails,
+          // marked's loop still tries the url rule here.
+          tok = tz.emStrong(rest, masked ??= this.computeMask(src), r)
+            || (!this.state.inLink ? tz.url(rest) : undefined);
+        } else if (c === 126) {
+          tok = tz.del(rest, masked ??= this.computeMask(src), r);
+        } else if (c === 32) {
+          tok = tz.br(rest);
+        } else {
+          // URL start (www. / scheme / e-mail word start), unless inside
+          // a link already.
+          tok = this.state.inLink ? undefined : tz.url(rest);
+        }
+        if (tok) {
+          if (tok.type === 'text') {
+            // Only reflink returns text tokens (an unresolved reference,
+            // just its first character): merge it, but do not touch r.
+            const last = tokens[tokens.length - 1];
+            if (last && last.type === 'text') {
+              last.raw += tok.raw;
+              last.text += tok.text;
+            } else {
+              tokens.push(tok);
+            }
+          } else {
+            tokens.push(tok);
+          }
+          r = '';
+          i = stop + tok.raw.length;
+          runStart = i;
+        } else {
+          // No rule matched: the character is literal text. A run of
+          // backticks or tildes is consumed whole here (marked's text rule
+          // takes the whole run as the first character of its match, so a
+          // shorter run left behind must not pair up with a later one);
+          // anything else advances by one character.
+          if (c === 96 || c === 126) {
+            let k = stop + 1;
+            while (k < n && src.charCodeAt(k) === c) k++;
+            i = k;
+          } else {
+            i = stop + 1;
+          }
+          runStart = stop;
+        }
+      }
+    } finally {
+      this.state.linkParenPossible = savedLinkParen;
+    }
+    return tokens;
   }
 }
 
